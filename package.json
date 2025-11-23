@@ -1,0 +1,22 @@
+{
+  "name": "backend",
+  "type": "module",
+  "version": "1.0.0",
+  "description": "",
+  "main": "app.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "@tavily/core": "^0.5.12",
+    "cors": "^2.8.5",
+    "dotenv": "^17.2.2",
+    "express": "^5.1.0",
+    "groq-sdk": "^0.31.0",
+    "node-cache": "^5.1.2",
+    "nvm": "^0.0.4",
+    "punycode": "^2.3.1"
+  }
+}
