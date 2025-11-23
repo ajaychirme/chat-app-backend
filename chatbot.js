@@ -2,167 +2,110 @@ import dotenv from 'dotenv';
 import Groq from 'groq-sdk';
 import { tavily } from '@tavily/core';
 import NodeCache from 'node-cache';
+import { type } from 'os';
+
+//tool calling => Used to interact with externam sources such as APIs, DB and web
 
 dotenv.config();
 
 const tvly = tavily({ apiKey: process.env.TAVILY_WEB_API_KEY });
 const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
-
-// cache conversation memory per thread for 24 hours
-const myCache = new NodeCache({ stdTTL: 60 * 60 * 24 });
-
-// How many times we allow the model to request NEED_SEARCH in one generate() call
-const MAX_TOOL_LOOPS = 3;
-
-// Helper: call Tavily
-async function webSearchByTavily(query) {
-  console.log('Calling Tavily web search with query:', query);
-
-  const response = await tvly.search({
-    query,
-    // you can tune these:
-    // max_results: 5,
-    // search_depth: 'basic',
-  });
-
-  // map to just the content text to keep token size lower
-  const finalResult = response.results.map((result) => result.content);
-  return finalResult;
+// cache memory till 24 hours using node official in memory cache system
+const myCache = new NodeCache({stdTTL: 60 * 60 * 24})
+// safe JSON parse helper
+function safeJSONParse(str) {
+  try {
+    return JSON.parse(str);
+  } catch (e) {
+    return null;
+  }
 }
 
-/**
- * Chat generate function
- * @param {string} userMessage - message from frontend
- * @param {string} threadId - unique id for conversation (e.g. userId or sessionId)
- * @returns {Promise<string>} - final assistant reply (no NEED_SEARCH ever)
- */
 export async function generate(userMessage, threadId) {
-  try {
-    // Base system + previous memory
-    const baseMessages = [
-      {
-        role: 'system',
-        content: `
-You are Hanuman, a helpful, polite personal assistant.
+  const baseMessages = [
+    {
+      role: 'system',
+      // Minimal change: instruct model to request searches using NEED_SEARCH:
+      content: `You are Hanuman, a smart personal assistant. Be always polite.
+If you need current/real-time info, reply exactly with: NEED_SEARCH: <search query>
+Otherwise answer normally.
+current date and time: ${new Date().toUTCString()}`,
+    },
+    // {
+    //   role: 'user',
+    //   content: 'When was iphone 16 launched?'
+    // }
+  ];
 
-- You can answer general knowledge questions directly.
-- If the user asks for current/real-time information (e.g. weather, live scores, stock prices, latest news),
-  then you MUST respond with exactly:
-  NEED_SEARCH: <best search query>
-  and nothing else.
+  const messages = myCache.get(threadId) ?? baseMessages
 
-- After you receive search results from a tool (role: "tool", name: "webSearch"),
-  you must use ONLY that information plus your knowledge to give a clear, friendly answer.
-- Never mention NEED_SEARCH or tools to the user in your final reply.
-
-Current date and time: ${new Date().toUTCString()}
-        `.trim(),
-      },
-    ];
-
-    // Restore previous conversation or start new
-    const cachedMessages = myCache.get(threadId);
-    const messages = cachedMessages ? [...cachedMessages] : [...baseMessages];
-
-    // Add the user message
     messages.push({
       role: 'user',
       content: userMessage,
-    });
+    })
 
-    // Loop allows: LLM → NEED_SEARCH → Tavily → LLM (final)
-    for (let i = 0; i < MAX_TOOL_LOOPS; i++) {
-      const completion = await groq.chat.completions.create({
-        model: 'llama-3.3-70b-versatile',
+    while (true) {
+      const completions = await groq.chat.completions.create({
         temperature: 0,
-        messages,
+        model: 'llama-3.3-70b-versatile',
+        messages: messages
+        // <-- Minimal change: removed `tools` and `tool_choice` because Groq rejects function execution
       });
-
-      const assistantMessage = completion.choices[0]?.message || {};
-      const assistantContent = assistantMessage.content || '';
-
-      // Save assistant message into conversation history
-      messages.push({
-        role: 'assistant',
-        content: assistantContent,
-      });
-
-      // If the model did NOT request a search → final answer
+  
+      // push the assistant message into messages (preserve your flow)
+      messages.push(completions.choices[0].message);
+  
+      // if assistant answered directly (no NEED_SEARCH), break
+      const assistantContent = completions.choices[0].message.content || '';
       if (!assistantContent.startsWith('NEED_SEARCH:')) {
-        console.log('Assistant (final):', assistantContent);
-        myCache.set(threadId, messages);
-        return assistantContent;
+        console.log(`Assistant1: ${assistantContent}`);
+        myCache.set(threadId, messages)
+        console.log("myCache1",JSON.stringify(myCache.data))
+        return completions.choices[0].message.content 
       }
-
-      // === NEED_SEARCH path ===
+  
+      // assistant asked for a search: extract query
       const rawQuery = assistantContent.replace('NEED_SEARCH:', '').trim();
       if (!rawQuery) {
-        console.error('NEED_SEARCH used but no query provided by model.');
-        const fallbackResponse =
-          "Sorry, I couldn't understand what to search for. Please rephrase your question.";
-        messages.push({
-          role: 'assistant',
-          content: fallbackResponse,
-        });
-        myCache.set(threadId, messages);
-        return fallbackResponse;
+        console.error('No query found after NEED_SEARCH:');
+        break;
       }
-
-      console.log('Model requested search for:', rawQuery);
-
-      // Call Tavily
-      let toolResult;
-      try {
-        toolResult = await webSearchByTavily(rawQuery);
-      } catch (err) {
-        console.error('Tavily search error:', err);
-        const errorResponse =
-          "I'm having trouble fetching live info right now. Please try again later.";
-        messages.push({
-          role: 'assistant',
-          content: errorResponse,
-        });
-        myCache.set(threadId, messages);
-        return errorResponse;
-      }
-
-      // Push tool result as a "tool" message into history
+  
+      // call Tavily (your original function)
+      const toolResult = await webSearchByTavily({ query: rawQuery });
+  
+      // Minimal fix: ensure tool_call_id exists (Groq requires it for role: 'tool')
+      // Use a fallback id if tool.id is not present in the tool calls (we're simulating)
+      const fallbackToolCallId = `webSearch_${Date.now()}`;
+  
       messages.push({
         role: 'tool',
+        tool_call_id: fallbackToolCallId,
         name: 'webSearch',
-        tool_call_id: `webSearch_${Date.now()}`, // synthetic id (Groq doesn't really use it)
         content: JSON.stringify(toolResult),
       });
-
-      // Ask Groq again to generate final answer using tool result
-      const completion2 = await groq.chat.completions.create({
-        model: 'llama-3.3-70b-versatile',
+  
+      // Now ask Groq again (finalize answer) — keep this small and consistent with your flow
+      const completions2 = await groq.chat.completions.create({
         temperature: 0,
-        messages,
+        model: 'llama-3.3-70b-versatile',
+        messages: messages
       });
-
-      const finalAssistantMessage = completion2.choices[0]?.message || {};
-      const finalContent = finalAssistantMessage.content || '';
-
-      console.log('Assistant (after tool):', finalContent);
-
-      messages.push({
-        role: 'assistant',
-        content: finalContent,
-      });
-
-      // End here – this is the final response user sees
-      myCache.set(threadId, messages);
-      return finalContent;
+  
+      console.log('Assistant2:', completions2.choices[0].message.content);
+      //here we end the chatbot response
+      myCache.set(threadId, messages)
+      return completions2.choices[0].message.content;
     }
 
-    // Safety fallback if MAX_TOOL_LOOPS exceeded
-    const loopError =
-      'Sorry, something went wrong while processing your request. Please try again.';
-    myCache.set(threadId, messages);
-    return loopError;
-  } catch (err) {
-    console.error('Fatal error in generate():', err);
-    return 'Sorry, I ran into an error while answering. Please try again in a moment.';
-  }
+}
+
+//=== TAVILY web api call ==
+async function webSearchByTavily({ query }) {
+  console.log('Calling web search... ', query);
+
+  const response = await tvly.search(query);
+  // default is 5 results - map to content as you already did
+  const finalResult = response.results.map(result => result.content);
+  return finalResult;
 }
